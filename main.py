@@ -110,6 +110,10 @@ def main_loop():
     USE_TICKERS_PREFILTER = env_int("USE_TICKERS_PREFILTER", 1)
     PREFILTER_MULTIPLIER = env_int("PREFILTER_MULTIPLIER", 1)
 
+    # Порог для исключения экстремальных пампов/дампов (в абсолютных процентах 24h).
+    # Например, 300 => исключить, если |priceChangePercent| >= 300.
+    EXCLUDE_ABS_24H_CHANGE_PCT = float(os.getenv("EXCLUDE_ABS_24H_CHANGE_PCT", "300"))
+
     TIMEFRAMES = parse_timeframes(os.getenv("TIMEFRAMES", "4H,1D,1W"))
     SORT_TF = check_sort_tf(os.getenv("SORT_TF", TIMEFRAMES[0]), TIMEFRAMES)
     logging.info(f"Binance: активные таймфреймы: {', '.join(TIMEFRAMES)} | сортировка по ATR: {SORT_TF}")
@@ -134,26 +138,44 @@ def main_loop():
             symbols = [it["symbol"] for it in instruments]
             logging.info(f"Всего символов: {len(symbols)}")
 
-            # 2) Быстрый префильтр по /ticker/24hr
+            # 2) Быстрый префильтр по /ticker/24hr с отсечкой экстремальных 24h изменений
             if USE_TICKERS_PREFILTER:
                 tickers = api.get_tickers()
                 tick_map = {t["symbol"]: t for t in tickers if t.get("symbol") in symbols}
                 rows = []
+                excluded_extreme = 0
                 for sym, t in tick_map.items():
                     try:
+                        # 24h range как прокси волатильности
                         high = float(t.get("highPrice") or 0)
                         low = float(t.get("lowPrice") or 0)
                         last = float(t.get("lastPrice") or 0)
                         if last <= 0 or high <= 0 or low <= 0:
                             continue
                         range_pct = (high - low) / last
+
+                        # Отсекаем экстремальные пампы/дампы по 24h
+                        chg_pct = t.get("priceChangePercent")
+                        if chg_pct is not None:
+                            try:
+                                chg_abs = abs(float(chg_pct))
+                                if chg_abs >= EXCLUDE_ABS_24H_CHANGE_PCT:
+                                    excluded_extreme += 1
+                                    continue
+                            except Exception:
+                                pass
+
                         rows.append({"symbol": sym, "range24h_pct": range_pct})
                     except Exception:
                         continue
+
                 rows = sorted(rows, key=lambda x: x["range24h_pct"], reverse=True)
                 pre_count = max(TOP_N * PREFILTER_MULTIPLIER, TOP_N)
                 pre_top = [r["symbol"] for r in rows[:pre_count]]
-                logging.info(f"Префильтр по 24h tickers (Binance): выбрано {len(pre_top)} (multiplier={PREFILTER_MULTIPLIER}).")
+                logging.info(
+                    f"Префильтр 24h (Binance): выбрано {len(pre_top)} (multiplier={PREFILTER_MULTIPLIER}), "
+                    f"исключено по экстремальному 24h изменению: {excluded_extreme} (порог {EXCLUDE_ABS_24H_CHANGE_PCT}%)."
+                )
             else:
                 pre_top = symbols
 
@@ -247,12 +269,13 @@ def main_loop():
                 bull_list = list(ex.map(add_oi, bull_list))
                 bear_list = list(ex.map(add_oi, bear_list))
 
-            # 6) Итоговая сортировка для вывода: по сумме RSI по всем выбранным ТФ (по убыванию)
+            # 6) Итоговая сортировка для вывода:
+            #    BULL — по сумме RSI по убыванию; BEAR — по сумме RSI по возрастанию
             def rsi_sum(item):
                 return sum(float(item.get(f"rsi_{tf}", 0.0)) for tf in TIMEFRAMES)
 
             bull_sorted = sorted(bull_list, key=rsi_sum, reverse=True)
-            bear_sorted = sorted(bear_list, key=rsi_sum, reverse=True)
+            bear_sorted = sorted(bear_list, key=rsi_sum, reverse=False)
 
             # 7) Формируем .txt и сохраняем
             report_text = build_report_txt(
